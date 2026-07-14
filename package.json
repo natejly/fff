@@ -8,6 +8,7 @@
     "server": "node server/index.js",
     "client": "vite --host 0.0.0.0",
     "build": "vite build",
+    "seed:restaurants": "node server/seed-fidi-restaurants.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "keywords": [],

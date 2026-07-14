@@ -1,8 +1,13 @@
 import express from "express";
 import "dotenv/config";
+import { readFileSync } from "node:fs";
 
 const app = express();
 const port = process.env.PORT || 4177;
+const fidiSeedSnapshot = JSON.parse(
+  readFileSync(new URL("./fidi-restaurants.json", import.meta.url), "utf8"),
+);
+const seededFidiRestaurants = fidiSeedSnapshot.restaurants || [];
 
 app.use(express.json());
 
@@ -356,8 +361,19 @@ const recentOrders = [
 
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const RESTAURANT_PROVIDER = process.env.RESTAURANT_PROVIDER || "overpass";
-const OVERPASS_API_URL = process.env.OVERPASS_API_URL || "https://overpass-api.de/api/interpreter";
+const FIDI_CENTER = { lat: 40.7069, lng: -74.0113 };
+const FIDI_SEED_RADIUS_MILES = fidiSeedSnapshot.radiusMiles || 1;
+const OVERPASS_API_URLS = [
+  process.env.OVERPASS_API_URL,
+  "https://overpass.private.coffee/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass-api.de/api/interpreter",
+].filter(Boolean);
 const providerColors = ["#2563eb", "#16a34a", "#dc2626", "#9333ea", "#0891b2", "#ca8a04"];
+const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+let fidiLiveRestaurants = [];
+let fidiRefreshPromise = null;
+let fidiLastRefresh = 0;
 
 function distanceMiles(a, b) {
   const toRad = (degrees) => (degrees * Math.PI) / 180;
@@ -474,7 +490,7 @@ function normalizeOsmCuisine(tags = {}) {
       .slice(0, 2)
       .join(", ");
   }
-  return (tags.amenity || "restaurant").replaceAll("_", " ");
+  return (tags.amenity || tags.shop || "restaurant").replaceAll("_", " ");
 }
 
 function normalizeOsmImage(tags = {}) {
@@ -510,34 +526,44 @@ function normalizeOsmElement(element, location) {
 async function fetchOverpassRestaurants(location, radiusMiles) {
   const radiusMeters = Math.max(100, Math.min(radiusMiles * 1609.34, 5000));
   const query = `
-    [out:json][timeout:20];
+    [out:json][timeout:60];
     (
-      node["amenity"~"^(restaurant|fast_food|cafe|food_court)$"]["name"](around:${radiusMeters},${location.lat},${location.lng});
-      way["amenity"~"^(restaurant|fast_food|cafe|food_court)$"]["name"](around:${radiusMeters},${location.lat},${location.lng});
-      relation["amenity"~"^(restaurant|fast_food|cafe|food_court)$"]["name"](around:${radiusMeters},${location.lat},${location.lng});
+      nwr["amenity"~"^(restaurant|fast_food|cafe|food_court|ice_cream)$"]["name"](around:${radiusMeters},${location.lat},${location.lng});
+      nwr["shop"~"^(bakery|deli|pastry|coffee|confectionery)$"]["name"](around:${radiusMeters},${location.lat},${location.lng});
     );
-    out center tags 50;
+    out center tags;
   `;
 
-  const response = await fetch(OVERPASS_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain;charset=UTF-8",
-      "User-Agent": "fidi-food-finder/1.0",
-    },
-    body: query,
-  });
+  const failures = [];
+  for (const endpoint of [...new Set(OVERPASS_API_URLS)]) {
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain;charset=UTF-8",
+          "User-Agent": "fidi-lunch/1.0",
+        },
+        body: query,
+        signal: AbortSignal.timeout(90000),
+      });
 
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(`Overpass request failed: ${response.status} ${message}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      return (data.elements || [])
+        .filter(
+          (element) =>
+            element.tags?.name &&
+            (element.lat || element.center?.lat) &&
+            (element.lon || element.center?.lon),
+        )
+        .map((element) => normalizeOsmElement(element, location))
+        .sort((a, b) => a.distance - b.distance);
+    } catch (error) {
+      failures.push(`${endpoint}: ${error.message}`);
+    }
   }
 
-  const data = await response.json();
-  return (data.elements || [])
-    .filter((element) => element.tags?.name && (element.lat || element.center?.lat) && (element.lon || element.center?.lon))
-    .map((element) => normalizeOsmElement(element, location))
-    .sort((a, b) => a.distance - b.distance);
+  throw new Error(`Every Overpass endpoint failed: ${failures.join("; ")}`);
 }
 
 function withDistance(items, location) {
@@ -547,6 +573,41 @@ function withDistance(items, location) {
       distance: Number(distanceMiles(location, restaurant).toFixed(2)),
     }))
     .sort((a, b) => a.distance - b.distance);
+}
+
+function mergeRestaurants(...collections) {
+  const merged = new Map();
+  collections.flat().forEach((restaurant) => {
+    if (!merged.has(restaurant.id)) merged.set(restaurant.id, restaurant);
+  });
+  return [...merged.values()];
+}
+
+function nearbyRestaurants(items, location, radius) {
+  return withDistance(items, location).filter((restaurant) => restaurant.distance <= radius);
+}
+
+function isFidiSearch(location) {
+  return distanceMiles(location, FIDI_CENTER) <= 0.5;
+}
+
+function refreshFidiRestaurants() {
+  const cacheIsFresh =
+    fidiLiveRestaurants.length > 0 && Date.now() - fidiLastRefresh < REFRESH_INTERVAL_MS;
+  if (cacheIsFresh || fidiRefreshPromise) return;
+
+  fidiRefreshPromise = fetchOverpassRestaurants(FIDI_CENTER, FIDI_SEED_RADIUS_MILES)
+    .then((liveRestaurants) => {
+      fidiLiveRestaurants = liveRestaurants.filter((restaurant) => restaurant.lng < -74);
+      fidiLastRefresh = Date.now();
+      console.log(`Refreshed ${fidiLiveRestaurants.length} live FiDi food venues`);
+    })
+    .catch((error) => {
+      console.error(`Unable to refresh FiDi restaurant data: ${error.message}`);
+    })
+    .finally(() => {
+      fidiRefreshPromise = null;
+    });
 }
 
 function findBowl(id) {
@@ -581,6 +642,22 @@ app.get("/api/restaurants", async (req, res) => {
   }
 
   if (RESTAURANT_PROVIDER === "overpass") {
+    if (isFidiSearch(location)) {
+      refreshFidiRestaurants();
+      const available = mergeRestaurants(fidiLiveRestaurants, seededFidiRestaurants);
+      const nearby = nearbyRestaurants(available, location, radius);
+      res.json({
+        provider: fidiLiveRestaurants.length ? "openstreetmap-live+seed" : "openstreetmap-seed",
+        restaurants: nearby,
+        allRestaurants: withDistance(available, location),
+        bowls: [],
+        allBowls: [],
+        center: location,
+        seedGeneratedAt: fidiSeedSnapshot.generatedAt,
+      });
+      return;
+    }
+
     try {
       const osmRestaurants = await fetchOverpassRestaurants(location, radius);
       res.json({
@@ -597,10 +674,13 @@ app.get("/api/restaurants", async (req, res) => {
     }
   }
 
-  const ordered = withDistance(restaurants, { lat, lng });
+  const fallbackRestaurants = isFidiSearch(location)
+    ? mergeRestaurants(seededFidiRestaurants, restaurants)
+    : restaurants;
+  const ordered = withDistance(fallbackRestaurants, location);
   const nearby = ordered.filter((restaurant) => restaurant.distance <= radius);
   res.json({
-    provider: "local",
+    provider: isFidiSearch(location) ? "seed+local" : "local",
     restaurants: nearby,
     allRestaurants: ordered,
     bowls: flattenBowls(nearby),
